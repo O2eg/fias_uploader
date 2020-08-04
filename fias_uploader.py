@@ -23,6 +23,7 @@ class InputData:
     data_dir = None
 
     fias_dicts = {
+        'fias_dict_actstat': [],
         'fias_dict_centerst': [],
         'fias_dict_currentstid': [],
         'fias_dict_eststat': [],
@@ -35,6 +36,7 @@ class InputData:
     }
 
     fias_dict_files = {
+        'fias_dict_actstat': 'ACTSTAT.DBF',
         'fias_dict_centerst': 'CENTERST.DBF',
         'fias_dict_currentstid': 'CURENTST.DBF',
         'fias_dict_eststat': 'ESTSTAT.DBF',
@@ -52,6 +54,24 @@ class InputData:
         'fias_nordoc': [],
         'fias_room': [],
         'fias_stead': []
+    }
+
+    fias_tbls_unique_consts = {
+        'fias_dict_actstat': 'fias_dict_actstat_actstatid_uq',
+        'fias_dict_centerst': 'fias_dict_centerst_centerstid_uq',
+        'fias_dict_currentstid': 'fias_dict_currentstid_curentstid_uq',
+        'fias_dict_eststat': 'fias_dict_eststat_eststatid_uq',
+        'fias_dict_flattype': 'fias_dict_flattype_fltypeid_uq',
+        'fias_dict_ndoctype': 'fias_dict_ndoctype_ndtypeid_uq',
+        'fias_dict_operstat': 'fias_dict_operstat_operstatid_uq',
+        'fias_dict_roomtype': 'fias_dict_roomtype_rmtypeid_uq',
+        'fias_dict_socrbase': 'fias_dict_socrbase_kod_t_st_uq',
+        'fias_dict_strstat': 'fias_dict_strstat_strstatid_uq',
+        'fias_addrob': 'fias_addrob_aoid_uq',
+        'fias_house': 'fias_house_centerstid_uq',
+        'fias_nordoc': 'fias_nordoc_uq',
+        'fias_room': 'fias_room_rmtypeid_uq',
+        'fias_stead': 'fias_stead_strstatid_uq'
     }
 
     fias_tbls_files = {}
@@ -123,14 +143,25 @@ class InputData:
         for d_name, _keys in input_data.fias_dicts.items():
             if len(_keys) == 0:
                 continue
-            print("Loading ============> " + d_name)
-            p_insert = await conn.prepare(
-                "INSERT INTO public.%s(%s) VALUES (%s)" % (
-                    d_name,
-                    ','.join(_keys),
-                    ','.join('$' + str(n) for n, i in enumerate(_keys, start=1))
+            print("%s ============> %s" % ('Updating' if is_update else 'Loading', d_name))
+            if is_update:
+                p_insert = await conn.prepare(
+                    "INSERT INTO public.%s(%s) VALUES (%s) ON CONFLICT ON CONSTRAINT %s DO UPDATE SET %s" % (
+                        d_name,
+                        ','.join(_keys),
+                        ','.join('$' + str(n) for n, i in enumerate(_keys, start=1)),
+                        self.fias_tbls_unique_consts[d_name],
+                        ','.join(['%s = EXCLUDED.%s' % (v, v) for v in _keys])
+                    )
                 )
-            )
+            else:
+                p_insert = await conn.prepare(
+                    "INSERT INTO public.%s(%s) VALUES (%s)" % (
+                        d_name,
+                        ','.join(_keys),
+                        ','.join('$' + str(n) for n, i in enumerate(_keys, start=1))
+                    )
+                )
             for rec in DBF(os.path.join(input_data.data_dir, input_data.fias_dict_files[d_name]), lowernames=True):
                 params = []
                 for pp in input_data.fias_dicts[d_name]:
@@ -148,16 +179,24 @@ class InputData:
                 ) and file.endswith('.DBF') and self.has_numbers(file):
                     self.files[file] = (self.get_fias_tbl(file), self.get_fias_tbl_keys(file))
 
-    async def run_task(self, v, pool, file):
+    async def run_task(self, v, pool, file, is_update):
         start = time.time()
         tbl_name = v[0]
         tbl_keys = v[1]
 
-        print("Loading ============> " + file)
+        print("%s ============> %s" % ('Updating' if is_update else 'Loading', file))
         try:
             async with pool.acquire() as conn:
                 cnt = 0
                 ins_recs = []
+                if is_update:
+                    stm = "INSERT INTO public.%s(%s) VALUES (%s) ON CONFLICT ON CONSTRAINT %s DO UPDATE SET %s" % (
+                        tbl_name,
+                        ','.join(tbl_keys),
+                        ','.join('$' + str(n) for n, i in enumerate(tbl_keys, start=1)),
+                        self.fias_tbls_unique_consts[tbl_name],
+                        ','.join(['%s = EXCLUDED.%s' % (v, v) for v in tbl_keys])
+                    )
                 for rec in DBF(os.path.join(self.data_dir, file), lowernames=True):
                     params = []
                     for pp in self.fias_tbls[tbl_name]:
@@ -166,25 +205,31 @@ class InputData:
                     cnt += 1
                     if cnt % self.insert_chunk_size == 0:
                         print('%s cnt = %d' % (file, cnt))
-                        await conn.copy_records_to_table(tbl_name, records=ins_recs, columns=tbl_keys)
+                        if is_update:
+                            await conn.executemany(stm, ins_recs)
+                        else:
+                            await conn.copy_records_to_table(tbl_name, records=ins_recs, columns=tbl_keys)
                         ins_recs.clear()
 
                 # push tail
                 if len(ins_recs) > 0:
-                    await conn.copy_records_to_table(tbl_name, records=ins_recs, columns=tbl_keys)
+                    if is_update:
+                        await conn.executemany(stm, ins_recs)
+                    else:
+                        await conn.copy_records_to_table(tbl_name, records=ins_recs, columns=tbl_keys)
                     ins_recs.clear()
         except:
             print(exception_helper())
-            print("===============> Failed %s" % file)
+            print("===============> Failed %s, tbl_name = %s, tbl_keys = %s" % (file, tbl_name, tbl_keys))
 
         end = time.time()
         print("Elapsed: %s [%s]" % (str(round(end - start, 2)), file))
 
-    def load(self, name='Default'):
-        print("=========> Load started [%s]" % str(name))
+    def load(self, is_update, name='Default'):
+        print("=========> %s started [%s]" % ('Updating' if is_update else 'Loading', str(name)))
         start_load = time.time()
 
-        async def run():
+        async def run(is_update):
             tasks = set()
             pool = await asyncpg.create_pool(
                 user=self.db_params['user'],
@@ -199,36 +244,42 @@ class InputData:
                 if len(tasks) >= self.conn_num:
                     # Wait for some upload to finish before adding a new one
                     _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                tasks.add(loop.create_task(self.run_task(v, pool, file)))
+                if v != (None, None):
+                    tasks.add(loop.create_task(self.run_task(v, pool, file, is_update)))
             # Wait for the remaining uploads to finish
             await asyncio.wait(tasks)
 
         loop = asyncio.get_event_loop()
         try:
-            loop.run_until_complete(run())
+            loop.run_until_complete(run(is_update))
         except asyncio.exceptions.TimeoutError:
             pass
 
         end_load = time.time()
-        print("<========= Load finished, elapsed: %s [%s]" % (str(round(end_load - start_load, 2)), str(name)))
+        print("<========= %s finished, elapsed: %s [%s]" % (
+            'Updating' if is_update else 'Loading',
+            str(round(end_load - start_load, 2)),
+            str(name)
+        ))
         return True
 
 
-def call_load(idx, queue, event, lock, dir, target_db, files, conn_per_proc_num, insert_chunk_size):
-    #with lock:
+def call_load(idx, queue, event, is_update, dir, target_db, files, conn_per_proc_num, insert_chunk_size):
     event.set()
     input_data = InputData(
         dir, target_db, files=files, conn_num=conn_per_proc_num, insert_chunk_size=insert_chunk_size
     )
-    res = input_data.load('Process %s' % idx)
+    res = input_data.load(is_update, 'Process %s' % idx)
     queue.put(res)
     queue.close()
 
 
 @asyncio.coroutine
-def run_processes(idx, queue, event, lock, dir, target_db, files, conn_per_proc_num, insert_chunk_size):
+def run_processes(idx, queue, event, is_update, dir, target_db, files, conn_per_proc_num, insert_chunk_size):
     p = aioprocessing.AioProcess(
-        target=call_load, args=(idx, queue, event, lock, dir, target_db, files, conn_per_proc_num, insert_chunk_size)
+        target=call_load, args=(
+            idx, queue, event, is_update, dir, target_db, files, conn_per_proc_num, insert_chunk_size
+        )
     )
     p.start()
     print("===============> Process %d started" % idx)
@@ -247,9 +298,10 @@ def chunks(data, parts):
 
 
 if __name__ == "__main__":
+    is_update = False
     input_dir = 'data'
     proc_num = 10
-    conn_per_proc_num = 5
+    conn_per_proc_num = 4
     insert_chunk_size = 5000
 
     target_db = {
@@ -279,7 +331,7 @@ if __name__ == "__main__":
         tasks.append(
             asyncio.ensure_future(
                 run_processes(
-                    idx + 1, queue, event, lock, input_dir, target_db, part, conn_per_proc_num, insert_chunk_size
+                    idx + 1, queue, event, is_update, input_dir, target_db, part, conn_per_proc_num, insert_chunk_size
                 )
             )
         )
